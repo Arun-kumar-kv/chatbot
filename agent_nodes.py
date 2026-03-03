@@ -652,10 +652,9 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             return db_rag_node(state, db_manager=db_manager)
         return {**state, "vector_results": [], "vector_results_text": "FAISS unavailable."}
 
-    # Qualitative RAG should retrieve a broad but relevant set.
-    # Full-index scans cause noisy context and misleading "total records" narratives.
-    threshold = _DB_RAG_SCORE_THRESHOLD if is_rag else None
-    top_k     = _DB_RAG_TOP_K if is_rag else None
+    # Qualitative RAG queries should scan the full vector index (user requested all matches).
+    threshold = 0.00 if is_rag else None
+    top_k     = (vector_store.total_vectors if is_rag else None)
 
     try:
         if threshold is not None and top_k is not None:
@@ -742,17 +741,7 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
 
     logger.info("[VectorSearch] strategy=%s top_k=%s threshold=%s → %d results",
                 strategy, top_k, threshold, len(results))
-
-    rag_total_records = state.get("rag_total_records")
-    if is_rag and db_manager and rag_total_records is None:
-        rag_total_records = _count_db_rag_records(db_manager)
-
-    return {
-        **state,
-        "vector_results": results,
-        "vector_results_text": results_text,
-        "rag_total_records": rag_total_records,
-    }
+    return {**state, "vector_results": results, "vector_results_text": results_text}
 
 
 # ── NODE 3: Generate SQL ───────────────────────────────────────────────────────
@@ -1012,13 +1001,10 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
 
     if strategy in ("vector_only", "db_rag") and rag_has_content:
         retrieved_count = len(state.get("vector_results", []))
-        db_total = state.get("rag_total_records")
-        db_total_line = f"Total text records in database scope: {db_total}\n" if isinstance(db_total, int) else ""
         rag_user_msg = f"""Question: {user_q}
 
-Retrieved relevant records: {retrieved_count}
-(This is the number of retrieved matches, not total database rows.)
-{db_total_line}(If database total is provided above, you may reference that exact number. Otherwise avoid claiming a database-wide total.)
+Total retrieved records: {retrieved_count}
+(Use this exact count in your analysis; do not invent a different total.)
 
 Retrieved Knowledge:
 {vec_text}
