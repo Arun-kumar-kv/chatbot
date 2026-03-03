@@ -583,9 +583,9 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             return db_rag_node(state, db_manager=db_manager)
         return {**state, "vector_results": [], "vector_results_text": "FAISS unavailable."}
 
-    # Qualitative RAG queries use lower threshold + more results for richer context
-    threshold = 0.30 if is_rag else None
-    top_k     = 25  if is_rag else None
+    # Qualitative RAG queries should scan the full vector index (user requested all matches).
+    threshold = 0.00 if is_rag else None
+    top_k     = (vector_store.total_vectors if is_rag else None)
 
     try:
         if threshold is not None and top_k is not None:
@@ -899,7 +899,8 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
     sql_row_count = sql_res.get("row_count", 0) if sql_success else 0
 
     sql_text = _truncate_sql_text(state.get("sql_results_text") or "")
-    vec_text = (state.get("vector_results_text") or "")[:4000]  # increased limit for RAG
+    vec_limit = 60000 if strategy == "db_rag" else 4000
+    vec_text = (state.get("vector_results_text") or "")[:vec_limit]
 
     # ── RAG path: db_rag or vector_only with actual results ────────────────────
     rag_has_content = (
@@ -913,7 +914,11 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
     )
 
     if strategy in ("vector_only", "db_rag") and rag_has_content:
+        retrieved_count = len(state.get("vector_results", []))
         rag_user_msg = f"""Question: {user_q}
+
+Total retrieved records: {retrieved_count}
+(Use this exact count in your analysis; do not invent a different total.)
 
 Retrieved Knowledge:
 {vec_text}
