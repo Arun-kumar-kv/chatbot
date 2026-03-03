@@ -606,10 +606,9 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             return db_rag_node(state, db_manager=db_manager)
         return {**state, "vector_results": [], "vector_results_text": "FAISS unavailable."}
 
-    # Qualitative RAG should retrieve a broad but relevant set.
-    # Full-index scans cause noisy context and misleading "total records" narratives.
-    threshold = _DB_RAG_SCORE_THRESHOLD if is_rag else None
-    top_k     = _DB_RAG_TOP_K if is_rag else None
+    # Qualitative RAG queries should scan the full vector index (user requested all matches).
+    threshold = 0.00 if is_rag else None
+    top_k     = (vector_store.total_vectors if is_rag else None)
 
     try:
         if threshold is not None and top_k is not None:
@@ -958,8 +957,8 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
         retrieved_count = len(state.get("vector_results", []))
         rag_user_msg = f"""Question: {user_q}
 
-Retrieved relevant records: {retrieved_count}
-(This is the number of retrieved matches, not total database rows. Do not claim a database-wide total unless explicitly provided.)
+Total retrieved records: {retrieved_count}
+(Use this exact count in your analysis; do not invent a different total.)
 
 Retrieved Knowledge:
 {vec_text}
