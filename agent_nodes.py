@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_MESSAGES = 6
 _MAX_SQL_RESULT_LINES = 120
+_DB_RAG_TOP_K = 400
+_DB_RAG_SCORE_THRESHOLD = 0.35
 
 _HYBRID_CAUSAL_KEYWORDS = {
     "why did", "why has", "why is", "why are", "why was", "why were",
@@ -116,6 +118,27 @@ def _truncate_sql_text(text: str) -> str:
 def _has_causal_keywords(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in _HYBRID_CAUSAL_KEYWORDS)
+
+
+def _sanitize_rag_answer_claims(answer: str, retrieved_count: int) -> str:
+    """Prevent dataset-wide count claims in qualitative RAG answers."""
+    if not answer:
+        return answer
+
+    replacement = f"a retrieved set of {retrieved_count} relevant records"
+    answer = re.sub(
+        r"total\s+of\s+\*\*?\d[\d,]*\s+records\*\*?",
+        replacement,
+        answer,
+        flags=re.IGNORECASE,
+    )
+    answer = re.sub(
+        r"total\s+of\s+\d[\d,]*\s+records",
+        replacement,
+        answer,
+        flags=re.IGNORECASE,
+    )
+    return answer
 
 
 # ── Schema column helpers ──────────────────────────────────────────────────────
@@ -599,6 +622,23 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             return db_rag_node(state, db_manager=db_manager)
         results = []
 
+    if is_rag and results:
+        # Defensive cap and de-duplication for noisy indexes / unexpected backend behaviour.
+        deduped = []
+        seen = set()
+        for r in results:
+            key = (r.get("text") or r.get("content") or r.get("description") or "").strip().lower()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(r)
+
+        if len(deduped) > _DB_RAG_TOP_K:
+            logger.warning("[VectorSearch] db_rag returned %d results, trimming to top %d", len(deduped), _DB_RAG_TOP_K)
+            deduped = deduped[:_DB_RAG_TOP_K]
+        results = deduped
+
     # ── Build clean RAG context from metadata ─────────────────────────────────
     if results:
         chunks = []
@@ -640,7 +680,7 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
         if chunks:
             if is_rag:
                 results_text = (
-                    f"Retrieved {len(chunks)} records from knowledge base for: '{query}'\n"
+                    f"Retrieved {len(chunks)} relevant records from knowledge base for: '{query}'\n"
                     f"{'='*60}\n\n" + "\n\n---\n".join(chunks)
                 )
             else:
@@ -653,8 +693,8 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
     else:
         results_text = "No semantically similar records found in the vector store."
 
-    logger.info("[VectorSearch] strategy=%s threshold=%s → %d results",
-                strategy, threshold, len(results))
+    logger.info("[VectorSearch] strategy=%s top_k=%s threshold=%s → %d results",
+                strategy, top_k, threshold, len(results))
     return {**state, "vector_results": results, "vector_results_text": results_text}
 
 
@@ -930,7 +970,7 @@ Please synthesize the above retrieved records into a clear, analytical answer.""
                 SystemMessage(content=_RAG_SYSTEM_PROMPT),
                 HumanMessage(content=rag_user_msg),
             ], context="rag_synthesise")
-            answer = response.content.strip()
+            answer = _sanitize_rag_answer_claims(response.content.strip(), retrieved_count)
         except Exception as exc:
             logger.error("[Synthesise-RAG] LLM failed: %s", exc)
             answer = f"I retrieved relevant records but could not format the answer due to an API issue.\n\nRaw results:\n{vec_text}"
