@@ -1,0 +1,28 @@
+# Property Management Agentic RAG Chatbot – Requirements
+# MySQL 5.7 + FAISS (single index + pkl metadata)
+# pip install -r requirements.txt
+
+# ── LLM & Agents ──────────────────────────────────────────────────────────────
+openai
+langchain
+langchain-openai
+langchain-core
+langgraph
+
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+
+# ── Database – MySQL 5.7 ──────────────────────────────────────────────────────
+mysql-connector-python
+# Alternative (lighter): PyMySQL>=1.1.0  (swap import in database.py if preferred)
+
+# ── Vector Store & Embeddings ─────────────────────────────────────────────────
+faiss-cpu
+sentence-transformers
+numpy
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv
+httpx
