@@ -54,6 +54,7 @@
 
 
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Configuration Settings - Property Management Agentic RAG Chatbot
 MySQL 5.7 + FAISS (single index file)
@@ -94,14 +95,15 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM: int   = int(os.getenv("EMBEDDING_DIM",  "1536"))   # 1536 for 3-small/ada-002, 3072 for 3-large
 VECTOR_TOP_K: int    = int(os.getenv("VECTOR_TOP_K",   "8"))
 
-# Adaptive similarity thresholds (spec §3.4)
-VECTOR_DEFAULT_THRESHOLD: float = float(os.getenv("VECTOR_DEFAULT_THRESHOLD", "0.65"))
-VECTOR_EXPAND_THRESHOLD: float  = float(os.getenv("VECTOR_EXPAND_THRESHOLD",  "0.45"))
+# Adaptive similarity thresholds
+# NOTE: For complaint/qualitative RAG, vector_search_node overrides these with lower values
+VECTOR_DEFAULT_THRESHOLD: float = float(os.getenv("VECTOR_DEFAULT_THRESHOLD", "0.40"))  # lowered from 0.65
+VECTOR_EXPAND_THRESHOLD: float  = float(os.getenv("VECTOR_EXPAND_THRESHOLD",  "0.20"))  # lowered from 0.45
 VECTOR_MIN_RESULTS: int         = int(os.getenv("VECTOR_MIN_RESULTS",         "3"))
 
 # ── Agent Settings ────────────────────────────────────────────────────────────
 MAX_SQL_RETRIES: int      = int(os.getenv("MAX_SQL_RETRIES",      "4"))
-SQL_QUERY_HARD_LIMIT: int = int(os.getenv("SQL_QUERY_HARD_LIMIT", "200"))
+SQL_QUERY_HARD_LIMIT: int = int(os.getenv("SQL_QUERY_HARD_LIMIT", "5000"))
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 API_HOST: str  = os.getenv("API_HOST", "0.0.0.0")
