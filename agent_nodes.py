@@ -57,6 +57,52 @@ _UNIT_STATUS_COL_CANDIDATES = [
 ]
 
 
+def _extract_sql_query_from_response(content: str) -> str:
+    """
+    Best-effort SQL extraction when the LLM does not return strict JSON.
+
+    Accepted patterns:
+      1) {"sql_query": "SELECT ..."}
+      2) ```sql ... ```
+      3) Raw SQL text beginning with SELECT/WITH
+    """
+    if not content:
+        return ""
+
+    raw = content.strip()
+
+    # 1) Strict/near-strict JSON path.
+    try:
+        parsed = _parse_json(raw)
+        sql = str(parsed.get("sql_query", "") or "").strip()
+        if sql:
+            return sql
+    except Exception:
+        pass
+
+    # 2) SQL code block path.
+    block = re.search(r"```(?:sql)?\s*(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if block:
+        candidate = block.group(1).strip()
+        if candidate:
+            return candidate
+
+    # 3) Raw SQL fallback path (handles extra prose before/after query).
+    m = re.search(r"\b(SELECT|WITH)\b[\s\S]*", raw, flags=re.IGNORECASE)
+    if not m:
+        return ""
+
+    candidate = m.group(0).strip()
+    # Trim common explanatory tail text if present.
+    candidate = re.split(
+        r"\n\s*(?:Explanation|Reasoning|Notes?)\s*:\s*",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    return candidate
+
+
 def _truncate_sql_text(text: str) -> str:
     if not text:
         return ""
@@ -693,11 +739,9 @@ def generate_sql_node(state: AgentState, db_manager, schema_manager, **_) -> Age
             "need_embedding": False, "embedding_params": [], "error": err_msg,
         }
 
-    try:
-        parsed    = _parse_json(response.content)
-        sql_query = parsed.get("sql_query", "").strip()
-    except Exception as exc:
-        err_msg = f"SQL generation returned invalid JSON: {exc}"
+    sql_query = _extract_sql_query_from_response(response.content)
+    if not sql_query:
+        err_msg = "SQL generation returned no extractable SQL query."
         logger.error("[GenerateSQL] %s | raw: %.200s", err_msg, response.content)
         return {
             **state,
@@ -705,17 +749,6 @@ def generate_sql_node(state: AgentState, db_manager, schema_manager, **_) -> Age
             "sql_query":           None,
             "sql_results":         {"success": False, "error": err_msg},
             "sql_attempt_history": history + [{"sql": "(parse failed)", "error": err_msg}],
-            "need_embedding": False, "embedding_params": [], "error": err_msg,
-        }
-
-    if not sql_query:
-        err_msg = "LLM returned empty sql_query."
-        return {
-            **state,
-            "sql_attempt":         attempt,
-            "sql_query":           None,
-            "sql_results":         {"success": False, "error": err_msg},
-            "sql_attempt_history": history + [{"sql": "(empty)", "error": err_msg}],
             "need_embedding": False, "embedding_params": [], "error": err_msg,
         }
 
