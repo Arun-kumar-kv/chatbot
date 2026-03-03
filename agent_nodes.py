@@ -522,6 +522,51 @@ _COMPLAINT_TEXT_QUERIES = [
 ]
 
 
+_DB_RAG_COUNT_QUERIES = [
+    """SELECT COUNT(*) AS CNT
+       FROM TERP_MAINT_INCIDENTS mi
+       WHERE mi.COMPLAINT_DESCRIPTION IS NOT NULL
+         AND mi.COMPLAINT_DESCRIPTION != ''
+         AND LENGTH(mi.COMPLAINT_DESCRIPTION) > 10""",
+    """SELECT COUNT(*) AS CNT
+       FROM TERP_LS_TICKET_TENANT tt
+       WHERE COALESCE(tt.REMARKS, tt.DESCRIPTION, tt.NOTES,
+                      tt.COMPLAINT, tt.FEEDBACK, tt.COMMENT) IS NOT NULL
+         AND COALESCE(tt.REMARKS, tt.DESCRIPTION, tt.NOTES,
+                      tt.COMPLAINT, tt.FEEDBACK, tt.COMMENT) != ''""",
+    """SELECT COUNT(*) AS CNT
+       FROM TERP_LS_LEGAL_TENANT_REQUEST lr
+       WHERE COALESCE(lr.DESCRIPTION, lr.MGMT_COMMENTS) IS NOT NULL
+         AND COALESCE(lr.DESCRIPTION, lr.MGMT_COMMENTS) != ''""",
+]
+
+
+def _count_db_rag_records(db_manager) -> Optional[int]:
+    """Best-effort count of text-bearing records used for qualitative complaint analysis."""
+    total = 0
+    ok = False
+
+    for sql in _DB_RAG_COUNT_QUERIES:
+        try:
+            result = db_manager.execute_query(sql.strip())
+            if not result.get("success"):
+                continue
+            rows = result.get("rows") or []
+            if not rows:
+                continue
+            first = rows[0]
+            if isinstance(first, dict):
+                cnt = first.get("CNT", 0)
+            else:
+                cnt = first[0] if len(first) > 0 else 0
+            total += int(cnt or 0)
+            ok = True
+        except Exception as exc:
+            logger.warning("[DB-RAG] Count query error: %s", exc)
+
+    return total if ok else None
+
+
 def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
     """
     Fetches actual complaint/ticket text rows directly from MySQL.
@@ -589,6 +634,7 @@ def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
         **state,
         "vector_results_text": rag_text,
         "vector_results":      [{"text": c, "source": "db_rag"} for c in all_chunks],
+        "rag_total_records":   _count_db_rag_records(db_manager),
         "strategy":            "db_rag",   # special strategy for synthesiser
     }
 
