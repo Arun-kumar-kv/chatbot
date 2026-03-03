@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_MESSAGES = 6
 _MAX_SQL_RESULT_LINES = 120
+_DB_RAG_TOP_K = 400
+_DB_RAG_SCORE_THRESHOLD = 0.35
 
 _HYBRID_CAUSAL_KEYWORDS = {
     "why did", "why has", "why is", "why are", "why was", "why were",
@@ -57,6 +59,52 @@ _UNIT_STATUS_COL_CANDIDATES = [
 ]
 
 
+def _extract_sql_query_from_response(content: str) -> str:
+    """
+    Best-effort SQL extraction when the LLM does not return strict JSON.
+
+    Accepted patterns:
+      1) {"sql_query": "SELECT ..."}
+      2) ```sql ... ```
+      3) Raw SQL text beginning with SELECT/WITH
+    """
+    if not content:
+        return ""
+
+    raw = content.strip()
+
+    # 1) Strict/near-strict JSON path.
+    try:
+        parsed = _parse_json(raw)
+        sql = str(parsed.get("sql_query", "") or "").strip()
+        if sql:
+            return sql
+    except Exception:
+        pass
+
+    # 2) SQL code block path.
+    block = re.search(r"```(?:sql)?\s*(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if block:
+        candidate = block.group(1).strip()
+        if candidate:
+            return candidate
+
+    # 3) Raw SQL fallback path (handles extra prose before/after query).
+    m = re.search(r"\b(SELECT|WITH)\b[\s\S]*", raw, flags=re.IGNORECASE)
+    if not m:
+        return ""
+
+    candidate = m.group(0).strip()
+    # Trim common explanatory tail text if present.
+    candidate = re.split(
+        r"\n\s*(?:Explanation|Reasoning|Notes?)\s*:\s*",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    return candidate
+
+
 def _truncate_sql_text(text: str) -> str:
     if not text:
         return ""
@@ -70,6 +118,27 @@ def _truncate_sql_text(text: str) -> str:
 def _has_causal_keywords(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in _HYBRID_CAUSAL_KEYWORDS)
+
+
+def _sanitize_rag_answer_claims(answer: str, retrieved_count: int) -> str:
+    """Prevent dataset-wide count claims in qualitative RAG answers."""
+    if not answer:
+        return answer
+
+    replacement = f"a retrieved set of {retrieved_count} relevant records"
+    answer = re.sub(
+        r"total\s+of\s+\*\*?\d[\d,]*\s+records\*\*?",
+        replacement,
+        answer,
+        flags=re.IGNORECASE,
+    )
+    answer = re.sub(
+        r"total\s+of\s+\d[\d,]*\s+records",
+        replacement,
+        answer,
+        flags=re.IGNORECASE,
+    )
+    return answer
 
 
 # ── Schema column helpers ──────────────────────────────────────────────────────
@@ -537,9 +606,10 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             return db_rag_node(state, db_manager=db_manager)
         return {**state, "vector_results": [], "vector_results_text": "FAISS unavailable."}
 
-    # Qualitative RAG queries use lower threshold + more results for richer context
-    threshold = 0.30 if is_rag else None
-    top_k     = 25  if is_rag else None
+    # Qualitative RAG should retrieve a broad but relevant set.
+    # Full-index scans cause noisy context and misleading "total records" narratives.
+    threshold = _DB_RAG_SCORE_THRESHOLD if is_rag else None
+    top_k     = _DB_RAG_TOP_K if is_rag else None
 
     try:
         if threshold is not None and top_k is not None:
@@ -552,6 +622,23 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
             logger.info("[VectorSearch] Search error — falling back to SQL-based RAG")
             return db_rag_node(state, db_manager=db_manager)
         results = []
+
+    if is_rag and results:
+        # Defensive cap and de-duplication for noisy indexes / unexpected backend behaviour.
+        deduped = []
+        seen = set()
+        for r in results:
+            key = (r.get("text") or r.get("content") or r.get("description") or "").strip().lower()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(r)
+
+        if len(deduped) > _DB_RAG_TOP_K:
+            logger.warning("[VectorSearch] db_rag returned %d results, trimming to top %d", len(deduped), _DB_RAG_TOP_K)
+            deduped = deduped[:_DB_RAG_TOP_K]
+        results = deduped
 
     # ── Build clean RAG context from metadata ─────────────────────────────────
     if results:
@@ -594,7 +681,7 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
         if chunks:
             if is_rag:
                 results_text = (
-                    f"Retrieved {len(chunks)} records from knowledge base for: '{query}'\n"
+                    f"Retrieved {len(chunks)} relevant records from knowledge base for: '{query}'\n"
                     f"{'='*60}\n\n" + "\n\n---\n".join(chunks)
                 )
             else:
@@ -607,8 +694,8 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
     else:
         results_text = "No semantically similar records found in the vector store."
 
-    logger.info("[VectorSearch] strategy=%s threshold=%s → %d results",
-                strategy, threshold, len(results))
+    logger.info("[VectorSearch] strategy=%s top_k=%s threshold=%s → %d results",
+                strategy, top_k, threshold, len(results))
     return {**state, "vector_results": results, "vector_results_text": results_text}
 
 
@@ -693,11 +780,9 @@ def generate_sql_node(state: AgentState, db_manager, schema_manager, **_) -> Age
             "need_embedding": False, "embedding_params": [], "error": err_msg,
         }
 
-    try:
-        parsed    = _parse_json(response.content)
-        sql_query = parsed.get("sql_query", "").strip()
-    except Exception as exc:
-        err_msg = f"SQL generation returned invalid JSON: {exc}"
+    sql_query = _extract_sql_query_from_response(response.content)
+    if not sql_query:
+        err_msg = "SQL generation returned no extractable SQL query."
         logger.error("[GenerateSQL] %s | raw: %.200s", err_msg, response.content)
         return {
             **state,
@@ -705,17 +790,6 @@ def generate_sql_node(state: AgentState, db_manager, schema_manager, **_) -> Age
             "sql_query":           None,
             "sql_results":         {"success": False, "error": err_msg},
             "sql_attempt_history": history + [{"sql": "(parse failed)", "error": err_msg}],
-            "need_embedding": False, "embedding_params": [], "error": err_msg,
-        }
-
-    if not sql_query:
-        err_msg = "LLM returned empty sql_query."
-        return {
-            **state,
-            "sql_attempt":         attempt,
-            "sql_query":           None,
-            "sql_results":         {"success": False, "error": err_msg},
-            "sql_attempt_history": history + [{"sql": "(empty)", "error": err_msg}],
             "need_embedding": False, "embedding_params": [], "error": err_msg,
         }
 
@@ -866,7 +940,8 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
     sql_row_count = sql_res.get("row_count", 0) if sql_success else 0
 
     sql_text = _truncate_sql_text(state.get("sql_results_text") or "")
-    vec_text = (state.get("vector_results_text") or "")[:4000]  # increased limit for RAG
+    vec_limit = 60000 if strategy == "db_rag" else 4000
+    vec_text = (state.get("vector_results_text") or "")[:vec_limit]
 
     # ── RAG path: db_rag or vector_only with actual results ────────────────────
     rag_has_content = (
@@ -880,7 +955,11 @@ def synthesise_answer_node(state: AgentState, **_) -> AgentState:
     )
 
     if strategy in ("vector_only", "db_rag") and rag_has_content:
+        retrieved_count = len(state.get("vector_results", []))
         rag_user_msg = f"""Question: {user_q}
+
+Retrieved relevant records: {retrieved_count}
+(This is the number of retrieved matches, not total database rows. Do not claim a database-wide total unless explicitly provided.)
 
 Retrieved Knowledge:
 {vec_text}
@@ -892,7 +971,7 @@ Please synthesize the above retrieved records into a clear, analytical answer.""
                 SystemMessage(content=_RAG_SYSTEM_PROMPT),
                 HumanMessage(content=rag_user_msg),
             ], context="rag_synthesise")
-            answer = response.content.strip()
+            answer = _sanitize_rag_answer_claims(response.content.strip(), retrieved_count)
         except Exception as exc:
             logger.error("[Synthesise-RAG] LLM failed: %s", exc)
             answer = f"I retrieved relevant records but could not format the answer due to an API issue.\n\nRaw results:\n{vec_text}"
