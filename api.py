@@ -259,14 +259,19 @@ async def chat(request: ChatRequest):
         sql_row_count = result["sql_results"].get("row_count")
 
     vec_count = len(result.get("vector_results") or [])
+    strategy = result.get("strategy")
+
+    vector_results_count = vec_count if vec_count > 0 else None
+    if strategy == "db_rag" and isinstance(result.get("rag_total_records"), int):
+        vector_results_count = result.get("rag_total_records")
 
     return ChatResponse(
         answer=result.get("final_answer", "Sorry, I could not generate an answer."),
         session_id=session_id,
-        strategy=result.get("strategy"),
+        strategy=strategy,
         sql_query=result.get("sql_query"),
         sql_row_count=sql_row_count,
-        vector_results_count=vec_count if vec_count > 0 else None,
+        vector_results_count=vector_results_count,
         sql_attempts=result.get("sql_attempts"),
         success=result.get("success", False),
         resolved_question=result.get("resolved_question"),
