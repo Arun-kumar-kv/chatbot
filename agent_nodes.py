@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 """
 LangGraph Node Functions - MySQL 5.7 + FAISS + SchemaManager
@@ -20,7 +22,7 @@ from typing import Any, Dict, Optional, Set
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from config import MAX_SQL_RETRIES
+from config import MAX_SQL_RETRIES,VECTOR_MIN_RESULTS,VECTOR_DEFAULT_THRESHOLD,VECTOR_EXPAND_THRESHOLD,VECTOR_TOP_K
 from agent_state import AgentState
 from llm_utils import get_llm as _get_llm, llm_invoke_with_retry, parse_json as _parse_json
 from prompts import (
@@ -236,6 +238,30 @@ _QUALITATIVE_COMPLAINT_PHRASES = {
     "nature of legal request", "types of legal request",
 }
 
+# Semantic / similarity search — these MUST use FAISS, never SQL
+# These ask "find records similar to X" or ask about sentiment/emotion in text
+_VECTOR_ONLY_PHRASES = {
+    # Similarity / "find like this"
+    "similar to", "find similar", "complaints like", "incidents like",
+    "find complaints about", "search for complaints",
+    "find incidents where", "find maintenance where",
+    "find records where", "find tenants who wrote",
+    # Sentiment / emotional content
+    "feeling unsafe", "feel unsafe", "felt unsafe",
+    "threatened to leave", "want to leave", "planning to leave",
+    "emotional complaint", "urgent complaint", "angry complaint",
+    "health concern", "health issue", "health problem",
+    "children affected", "child affected", "kids affected", "children being affected",
+    "safety hazard", "feel safe", "dangerous",
+    "praised", "happy with", "satisfied with", "appreciated",
+    "compared to other", "mentioned lawyer", "legal action",
+    "moving out soon", "early termination mention",
+    # Semantic search intent keywords
+    "semantically", "meaning", "context of", "sentiment",
+    "unusual terms", "special arrangement", "unusual clause",
+    "force majeure", "act of god",
+}
+
 # These are QUANTITATIVE even if they use qualitative-sounding words
 # (they ask for lists/counts/rankings, not text content)
 _QUANTITATIVE_OVERRIDES = {
@@ -262,24 +288,36 @@ _QUANTITATIVE_OVERRIDES = {
 
 def _classify_question(question: str) -> str:
     """
-    Classify question into: 'db_rag', 'sql_only', or 'llm_decides'
-
-    Returns:
-      'db_rag'     → qualitative complaint content question → FAISS RAG
-      'sql_only'   → clear quantitative/list/ranking question → SQL
-      'llm_decides'→ ambiguous, let the LLM router decide
+    Classify question into: 'conversational', 'db_rag', 'vector_only', 'sql_only', or 'llm_decides'
     """
-    q = question.lower()
+    q = question.lower().strip().rstrip("?!.")
 
-    # Step 1: Check quantitative overrides FIRST — these are never db_rag
+    # Step 0: Pure conversational — never touch DB
+    _CONVERSATIONAL = {
+        "who are you", "what are you", "what can you do", "help me",
+        "hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye",
+        "what is your name", "whats your name", "tell me about yourself",
+        "how are you", "what do you do", "who made you", "are you an ai",
+        "are you a bot", "are you human", "good morning", "good afternoon",
+        "good evening",
+    }
+    if q in _CONVERSATIONAL:
+        return "conversational"
+
+    # Step 1: Semantic / similarity search — check FIRST before quantitative overrides
+    # because "show tenants who praised..." has "show" but is clearly semantic
+    if any(phrase in q for phrase in _VECTOR_ONLY_PHRASES):
+        return "vector_only"
+
+    # Step 2: Quantitative overrides — never vector or rag
     if any(kw in q for kw in _QUANTITATIVE_OVERRIDES):
         return "sql_only"
 
-    # Step 2: Check strict qualitative complaint phrases
+    # Step 3: Strict qualitative complaint theme phrases → SQL aggregation RAG
     if any(phrase in q for phrase in _QUALITATIVE_COMPLAINT_PHRASES):
         return "db_rag"
 
-    # Step 3: Loose complaint keywords — only qualify if NO quantitative context
+    # Step 4: Loose complaint keywords
     _LOOSE_COMPLAINT_KW = {
         "complaint", "complaints", "complain",
         "tenant issue", "tenant problem", "tenant complaint",
@@ -289,7 +327,6 @@ def _classify_question(question: str) -> str:
         "frequently reported", "frequently received",
     }
     if any(kw in q for kw in _LOOSE_COMPLAINT_KW):
-        # Extra check: if question has numbers/ranking intent → sql_only
         _numeric_intent = {
             "how many", "total", "count", "number", "most", "least",
             "highest", "lowest", "top", "bottom", "rank", "list",
@@ -312,11 +349,38 @@ def route_query_node(state, db_manager, vector_store, schema_manager) -> AgentSt
     question_type = _classify_question(question)
     logger.info("[Router] question_type=%s for: %.80s", question_type, question)
 
+    if question_type == "conversational":
+        return {
+            **state,
+            "strategy":            "conversational",
+            "routing_reasoning":   "Conversational / identity question",
+            "vector_query":        None,
+            "sql_attempt":         0,
+            "sql_attempt_history": [],
+            "max_sql_retries":     MAX_SQL_RETRIES,
+            "need_embedding":      False,
+            "embedding_params":    [],
+        }
+
+    if question_type == "vector_only":
+        logger.info("[Router] Semantic search question → vector_only (FAISS)")
+        return {
+            **state,
+            "strategy":            "vector_only",
+            "routing_reasoning":   "Semantic similarity / sentiment / find-similar → FAISS vector search",
+            "vector_query":        question,
+            "sql_attempt":         0,
+            "sql_attempt_history": [],
+            "max_sql_retries":     MAX_SQL_RETRIES,
+            "need_embedding":      False,
+            "embedding_params":    [],
+        }
+
     if question_type == "db_rag":
         return {
             **state,
             "strategy":            "db_rag",
-            "routing_reasoning":   "Qualitative complaint/feedback question → FAISS RAG synthesis",
+            "routing_reasoning":   "Qualitative complaint theme question → SQL aggregation RAG",
             "vector_query":        question,
             "sql_attempt":         0,
             "sql_attempt_history": [],
@@ -439,38 +503,9 @@ _COMPLAINT_TEXT_QUERIES = [
 ]
 
 
-# ── RAG SQL queries — aggregated directly in MySQL (fast, no row transfer) ───
+# ── RAG SQL queries — full aggregation in MySQL, no large row transfers ───────
 
-# Query 1: Category counts from the incident type FK table (if it exists)
-_RAG_COUNT_BY_TYPE = """
-    SELECT it.NAME AS CATEGORY, COUNT(*) AS CNT
-    FROM TERP_MAINT_INCIDENTS mi
-    LEFT JOIN TERP_LS_INCIDENT_TYPE it ON it.ID = mi.INCIDENT_TYPE
-    WHERE mi.COMPLAINT_DESCRIPTION IS NOT NULL AND mi.COMPLAINT_DESCRIPTION != ''
-      AND it.NAME IS NOT NULL
-    GROUP BY it.NAME ORDER BY CNT DESC LIMIT 30
-"""
-
-# Query 2: Total count + sample of actual complaint texts (small fetch)
-_RAG_SAMPLE_COMPLAINTS = """
-    SELECT
-        t.NAME   AS TENANT_NAME,
-        p.NAME   AS PROPERTY_NAME,
-        mi.INCIDENT_DATE,
-        CASE WHEN mi.RESOLVED_DATE IS NULL THEN 'Open' ELSE 'Resolved' END AS STATUS,
-        LEFT(mi.COMPLAINT_DESCRIPTION, 400) AS COMPLAINT_TEXT
-    FROM TERP_MAINT_INCIDENTS mi
-    LEFT JOIN TERP_LS_TENANTS t        ON t.ID  = mi.TENANT_NAME
-    LEFT JOIN TERP_LS_PROPERTY_UNIT pu ON pu.ID = mi.PROPERTY_UNIT
-    LEFT JOIN TERP_LS_PROPERTY p        ON p.ID  = pu.PROPERTY_ID
-    WHERE mi.COMPLAINT_DESCRIPTION IS NOT NULL
-      AND mi.COMPLAINT_DESCRIPTION != ''
-      AND LENGTH(mi.COMPLAINT_DESCRIPTION) > 10
-    ORDER BY mi.INCIDENT_DATE DESC
-    LIMIT 80
-"""
-
-# Query 3: Total record count
+# Query 1: Total count
 _RAG_TOTAL_COUNT = """
     SELECT COUNT(*) AS TOTAL
     FROM TERP_MAINT_INCIDENTS
@@ -479,20 +514,90 @@ _RAG_TOTAL_COUNT = """
       AND LENGTH(COMPLAINT_DESCRIPTION) > 10
 """
 
+# Query 2: Keyword frequency counts across ALL records — runs entirely in MySQL
+# Each SUM(CASE WHEN ... LIKE ...) scans the full table but transfers only 1 row
+_RAG_KEYWORD_COUNTS = """
+    SELECT
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'water|leak|pipe|drain|flood|sink|plumb|sewage|toilet|shower|tap|faucet|blockage|clog' THEN 1 ELSE 0 END) AS water_plumbing,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'ac |air.condition|cooling|hvac|chiller|aircon|thermostat|cool' THEN 1 ELSE 0 END) AS ac_cooling,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'electric|power|light|wiring|socket|circuit|breaker|switch|bulb|lamp' THEN 1 ELSE 0 END) AS electrical,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'elevator|lift' THEN 1 ELSE 0 END) AS elevator_lift,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'noise|loud|sound|disturb|barking|party' THEN 1 ELSE 0 END) AS noise,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'pest|insect|cockroach|ant |rat |mouse|bug |mosquito|spider' THEN 1 ELSE 0 END) AS pest_insects,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'parking|car park|vehicle|garage' THEN 1 ELSE 0 END) AS parking,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'internet|wifi|wi-fi|network|broadband|router' THEN 1 ELSE 0 END) AS internet_wifi,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'clean|dirty|trash|garbage|waste|hygiene|smell|odor|odour' THEN 1 ELSE 0 END) AS cleanliness_smell,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'door|window|lock|key |handle|seal|hinge|glass' THEN 1 ELSE 0 END) AS door_window,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'pool|gym|amenity|amenities|facilities|beach|garden|spa' THEN 1 ELSE 0 END) AS amenities,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'no response|delay|waiting|ignored|follow.up|not respond|no one came|nobody came' THEN 1 ELSE 0 END) AS response_delay,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'again|still |repeated|10th time|multiple times|not fixed|not resolved|same issue|same problem' THEN 1 ELSE 0 END) AS repeated_issues,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'urgent|emergency|asap|immediately|critical|danger' THEN 1 ELSE 0 END) AS urgent,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'paint|wall|ceiling|crack|floor|tile|grout|damp|mold|mould|rust' THEN 1 ELSE 0 END) AS structural,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'heater|hot water|boiler|geyser|heating' THEN 1 ELSE 0 END) AS hot_water_heating,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'kitchen|oven|stove|cooker|refrigerator|fridge|dishwasher|microwave|washing machine|dryer' THEN 1 ELSE 0 END) AS appliances,
+      SUM(CASE WHEN LOWER(COMPLAINT_DESCRIPTION) REGEXP 'balcony|terrace|outdoor|garden|courtyard' THEN 1 ELSE 0 END) AS balcony_outdoor,
+      COUNT(*) AS total_records
+    FROM TERP_MAINT_INCIDENTS
+    WHERE COMPLAINT_DESCRIPTION IS NOT NULL
+      AND COMPLAINT_DESCRIPTION != ''
+      AND LENGTH(COMPLAINT_DESCRIPTION) > 10
+"""
+
+# Query 3: Per-property breakdown — which properties have most complaints
+_RAG_PROPERTY_COUNTS = """
+    SELECT
+        p.NAME AS PROPERTY_NAME,
+        COUNT(mi.ID) AS TOTAL_COMPLAINTS,
+        SUM(CASE WHEN mi.RESOLVED_DATE IS NULL THEN 1 ELSE 0 END) AS OPEN,
+        SUM(CASE WHEN mi.RESOLVED_DATE IS NOT NULL THEN 1 ELSE 0 END) AS RESOLVED
+    FROM TERP_MAINT_INCIDENTS mi
+    LEFT JOIN TERP_LS_PROPERTY_UNIT pu ON pu.ID = mi.PROPERTY_UNIT
+    LEFT JOIN TERP_LS_PROPERTY p        ON p.ID  = pu.PROPERTY_ID
+    WHERE mi.COMPLAINT_DESCRIPTION IS NOT NULL
+      AND mi.COMPLAINT_DESCRIPTION != ''
+    GROUP BY p.ID, p.NAME
+    ORDER BY TOTAL_COMPLAINTS DESC
+    LIMIT 15
+"""
+
+# Query 4: Representative sample — 3 examples per category for quotes
+# Uses ORDER BY RAND() with small LIMIT to get diverse examples
+_RAG_SAMPLE_COMPLAINTS = """
+    SELECT
+        t.NAME   AS TENANT_NAME,
+        p.NAME   AS PROPERTY_NAME,
+        mi.INCIDENT_DATE,
+        CASE WHEN mi.RESOLVED_DATE IS NULL THEN 'Open' ELSE 'Resolved' END AS STATUS,
+        LEFT(mi.COMPLAINT_DESCRIPTION, 300) AS COMPLAINT_TEXT
+    FROM TERP_MAINT_INCIDENTS mi
+    LEFT JOIN TERP_LS_TENANTS t        ON t.ID  = mi.TENANT_NAME
+    LEFT JOIN TERP_LS_PROPERTY_UNIT pu ON pu.ID = mi.PROPERTY_UNIT
+    LEFT JOIN TERP_LS_PROPERTY p        ON p.ID  = pu.PROPERTY_ID
+    WHERE mi.COMPLAINT_DESCRIPTION IS NOT NULL
+      AND mi.COMPLAINT_DESCRIPTION != ''
+      AND LENGTH(mi.COMPLAINT_DESCRIPTION) > 10
+    ORDER BY RAND()
+    LIMIT 120
+"""
+
 
 def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
     """
-    Fast RAG node: runs 3 lightweight SQL queries (aggregates + small sample).
-    No large row transfers. Total DB time: ~200ms.
+    Fast full-DB RAG analysis:
+      Q1: COUNT(*) — total records
+      Q2: SUM(REGEXP) per keyword category — counts ALL 6000+ records in MySQL, 1 row returned
+      Q3: GROUP BY property — complaint volume per property
+      Q4: ORDER BY RAND() LIMIT 120 — diverse sample for example quotes
+    Total: 4 SQL calls, ~500ms, no large row transfers.
     """
     question = state.get("resolved_question") or state["user_question"]
-    logger.info("[DB-RAG] Running fast SQL aggregation for: %.80s", question)
+    logger.info("[DB-RAG] Full-DB aggregation for: %.80s", question)
 
     context_parts = []
     total_count   = 0
     sample_rows   = []
 
-    # ── 1. Total count ────────────────────────────────────────────────────────
+    # ── Q1: Total count ───────────────────────────────────────────────────────
     try:
         r = db_manager.execute_query(_RAG_TOTAL_COUNT.strip())
         if r.get("success") and r.get("rows"):
@@ -500,31 +605,85 @@ def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
             cols = r.get("column_names", [])
             d    = row if isinstance(row, dict) else dict(zip(cols, row))
             total_count = int(d.get("TOTAL") or 0)
-            context_parts.append(f"TOTAL COMPLAINTS IN DATABASE: {total_count}")
-            logger.info("[DB-RAG] Total complaints: %d", total_count)
+            logger.info("[DB-RAG] Total records: %d", total_count)
     except Exception as e:
-        logger.warning("[DB-RAG] count query failed: %s", e)
+        logger.warning("[DB-RAG] total count failed: %s", e)
 
-    # ── 2. Category breakdown (fast GROUP BY) ─────────────────────────────────
+    # ── Q2: Keyword frequency — counts ALL records via REGEXP in MySQL ─────────
     try:
-        r = db_manager.execute_query(_RAG_COUNT_BY_TYPE.strip())
+        r = db_manager.execute_query(_RAG_KEYWORD_COUNTS.strip())
+        if r.get("success") and r.get("rows"):
+            row  = r["rows"][0]
+            cols = r.get("column_names", [])
+            d    = row if isinstance(row, dict) else dict(zip(cols, row))
+
+            CATEGORY_LABELS = {
+                "water_plumbing":    "Water / Plumbing / Drainage",
+                "ac_cooling":        "AC & Cooling",
+                "electrical":        "Electrical Issues",
+                "cleanliness_smell": "Cleanliness & Bad Smells",
+                "structural":        "Structural (Walls/Ceiling/Paint)",
+                "appliances":        "Kitchen & Appliances",
+                "door_window":       "Doors, Windows & Locks",
+                "hot_water_heating": "Hot Water & Heating",
+                "repeated_issues":   "Repeated / Unresolved Issues",
+                "response_delay":    "Response Delays & No Follow-up",
+                "noise":             "Noise Disturbances",
+                "amenities":         "Amenities (Pool/Gym/Garden)",
+                "balcony_outdoor":   "Balcony & Outdoor Areas",
+                "elevator_lift":     "Elevator / Lift",
+                "urgent":            "Urgent / Emergency Requests",
+                "pest_insects":      "Pest & Insect Infestations",
+                "parking":           "Parking Issues",
+                "internet_wifi":     "Internet & WiFi",
+            }
+
+            total_ref = int(d.get("total_records") or total_count or 1)
+            lines = []
+            for key, label in CATEGORY_LABELS.items():
+                cnt = int(d.get(key) or 0)
+                if cnt > 0:
+                    pct = round(cnt * 100 / total_ref, 1)
+                    lines.append((cnt, f"  {label:<40} {cnt:>5} complaints  ({pct}%)"))
+
+            # Sort by count descending
+            lines.sort(key=lambda x: x[0], reverse=True)
+            freq_block = "\n".join(l for _, l in lines)
+
+            context_parts.append(
+                f"KEYWORD FREQUENCY — ALL {total_ref} RECORDS (counted in database):\n"
+                f"{'─'*60}\n"
+                f"{freq_block}"
+            )
+            logger.info("[DB-RAG] Keyword counts done: %d categories with data", len(lines))
+    except Exception as e:
+        logger.warning("[DB-RAG] keyword count failed: %s", e)
+
+    # ── Q3: Per-property breakdown ────────────────────────────────────────────
+    try:
+        r = db_manager.execute_query(_RAG_PROPERTY_COUNTS.strip())
         if r.get("success") and r.get("rows"):
             rows = r["rows"]
             cols = r.get("column_names", [])
             lines = []
             for row in rows:
-                d   = row if isinstance(row, dict) else dict(zip(cols, row))
-                cat = str(d.get("CATEGORY") or d.get("NAME") or "Unknown")
-                cnt = int(d.get("CNT") or 0)
-                pct = f"{cnt*100//total_count}%" if total_count else ""
-                lines.append(f"  {cat:<35} {cnt:>5}  {pct}")
+                d    = row if isinstance(row, dict) else dict(zip(cols, row))
+                prop = str(d.get("PROPERTY_NAME") or "Unknown")
+                tot  = int(d.get("TOTAL_COMPLAINTS") or 0)
+                open_= int(d.get("OPEN") or 0)
+                res  = int(d.get("RESOLVED") or 0)
+                lines.append(f"  {prop:<40} {tot:>5} total  ({open_} open, {res} resolved)")
             if lines:
-                context_parts.append("COMPLAINT COUNTS BY CATEGORY:\n" + "\n".join(lines))
-                logger.info("[DB-RAG] Got %d categories", len(lines))
+                context_parts.append(
+                    f"COMPLAINTS BY PROPERTY (top {len(lines)}):\n"
+                    f"{'─'*60}\n"
+                    + "\n".join(lines)
+                )
+                logger.info("[DB-RAG] Property breakdown: %d properties", len(lines))
     except Exception as e:
-        logger.warning("[DB-RAG] category count failed: %s", e)
+        logger.warning("[DB-RAG] property count failed: %s", e)
 
-    # ── 3. Sample complaints (small fetch — only 80 rows, LEFT() truncated) ───
+    # ── Q4: Random sample for example quotes ─────────────────────────────────
     try:
         r = db_manager.execute_query(_RAG_SAMPLE_COMPLAINTS.strip())
         if r.get("success") and r.get("rows"):
@@ -535,30 +694,33 @@ def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
                 d      = row if isinstance(row, dict) else dict(zip(cols, row))
                 tenant = str(d.get("TENANT_NAME") or "").strip()
                 prop   = str(d.get("PROPERTY_NAME") or "").strip()
-                date   = str(d.get("INCIDENT_DATE") or "")[:10]
                 status = str(d.get("STATUS") or "")
                 text   = str(d.get("COMPLAINT_TEXT") or "").strip()
                 if not text:
                     continue
-                meta = " | ".join(filter(None, [tenant, prop, date, status]))
+                meta = " | ".join(filter(None, [tenant, prop, status]))
                 sample_lines.append(f"[{i}] {meta}\n{text}")
-                sample_rows.append({"source": "Maintenance Incidents", "tenant": tenant,
-                                    "property": prop, "text": text, "status": status})
+                sample_rows.append({"source": "Maintenance Incidents",
+                                    "tenant": tenant, "property": prop, "text": text})
             if sample_lines:
                 context_parts.append(
-                    f"SAMPLE COMPLAINTS (most recent {len(sample_lines)} of {total_count}):\n"
+                    f"SAMPLE COMPLAINTS ({len(sample_lines)} random records for examples):\n"
+                    f"{'─'*60}\n"
                     + "\n\n".join(sample_lines)
                 )
-                logger.info("[DB-RAG] Got %d sample complaints", len(sample_lines))
+                logger.info("[DB-RAG] Sample: %d records", len(sample_lines))
     except Exception as e:
         logger.warning("[DB-RAG] sample query failed: %s", e)
 
     if not context_parts:
-        logger.warning("[DB-RAG] All queries failed — no data")
+        logger.warning("[DB-RAG] All queries failed")
         return {**state, "vector_results_text": "", "vector_results": [], "strategy": "db_rag"}
 
-    full_context = "\n\n" + ("\n\n" + "─"*55 + "\n\n").join(context_parts)
-    logger.info("[DB-RAG] Context built: %d chars, %d sample rows", len(full_context), len(sample_rows))
+    full_context = (
+        f"TOTAL COMPLAINTS IN DATABASE: {total_count}\n\n"
+        + ("\n\n" + "═"*60 + "\n\n").join(context_parts)
+    )
+    logger.info("[DB-RAG] Context: %d chars", len(full_context))
 
     return {
         **state,
@@ -567,6 +729,7 @@ def db_rag_node(state: AgentState, db_manager, **_) -> AgentState:
         "vector_results_count": total_count,
         "strategy":             "db_rag",
     }
+
 
 
 def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) -> AgentState:
@@ -590,23 +753,41 @@ def vector_search_node(state: AgentState, vector_store, db_manager=None, **_) ->
         return {**state, "vector_results": [], "vector_results_text": "FAISS unavailable."}
 
     # ── vector_only / hybrid: use FAISS semantic search ───────────────────────
-    # Expand query for better recall
+    # Expand query for better semantic recall
     q_lower = query.lower()
     expanded_query = query
-    if any(w in q_lower for w in ["complaint", "issue", "problem", "frequently", "common", "reported"]):
+
+    if any(w in q_lower for w in ["unsafe", "safety", "dangerous", "hazard", "scared", "afraid"]):
+        expanded_query = f"{query} tenant feels unsafe dangerous security risk afraid scared"
+    elif any(w in q_lower for w in ["threaten", "leave", "move out", "vacate", "terminate"]):
+        expanded_query = f"{query} tenant wants to leave move out early termination vacate"
+    elif any(w in q_lower for w in ["health", "sick", "illness", "mold", "mould", "toxic", "children", "child", "kids"]):
+        expanded_query = f"{query} tenant health problem sick children family affected"
+    elif any(w in q_lower for w in ["praise", "happy", "satisfied", "appreciate", "thank", "excellent"]):
+        expanded_query = f"{query} tenant satisfied happy praise good service excellent"
+    elif any(w in q_lower for w in ["lawyer", "legal", "sue", "court", "authority"]):
+        expanded_query = f"{query} tenant legal action lawyer court authority complaint"
+    elif any(w in q_lower for w in ["similar", "like this", "find similar"]):
+        expanded_query = f"{query} complaint maintenance incident"
+    elif any(w in q_lower for w in ["complaint", "issue", "problem", "frequently", "common", "reported"]):
         expanded_query = f"{query} tenant complaint maintenance incident description"
     elif any(w in q_lower for w in ["contract", "lease", "agreement", "terms", "note"]):
         expanded_query = f"{query} contract notes terms business"
     elif any(w in q_lower for w in ["tenant", "resident", "renter"]):
         expanded_query = f"{query} tenant information"
 
+    # For semantic/similarity queries use lower threshold for better recall
     top_k     = VECTOR_TOP_K
     threshold = VECTOR_DEFAULT_THRESHOLD
 
     try:
         results = vector_store.search(expanded_query, top_k=top_k, score_threshold=threshold)
+        # If too few results, retry with lower threshold
+        if len(results) < 5:
+            results = vector_store.search(expanded_query, top_k=top_k, score_threshold=VECTOR_EXPAND_THRESHOLD)
+        # If still nothing, try original query
         if not results and expanded_query != query:
-            results = vector_store.search(query, top_k=top_k, score_threshold=threshold)
+            results = vector_store.search(query, top_k=top_k, score_threshold=VECTOR_EXPAND_THRESHOLD)
     except Exception as exc:
         logger.error("[VectorSearch] search failed: %s", exc)
         results = []
@@ -880,33 +1061,35 @@ def _format_sql_results(result: Dict[str, Any]) -> str:
 # ── NODE 5: Synthesise Answer ──────────────────────────────────────────────────
 
 # Dedicated RAG prompt for pure vector_only qualitative questions
-_RAG_SYSTEM_PROMPT = """You are an expert Property & Lease Management analyst for a real estate ERP system.
+_RAG_SYSTEM_PROMPT = """You are an expert Property & Lease Management analyst.
 
-You have been given real complaint/ticket records from the database.
-Each record shows: Tenant, Property, Incident Type, Category, Date, Status, and the complaint text.
+You will receive:
+1. KEYWORD FREQUENCY TABLE — exact counts from ALL records in the database
+2. COMPLAINTS BY PROPERTY — which properties have the most complaints
+3. SAMPLE COMPLAINTS — random real examples from tenants for quoting
 
-YOUR JOB: Read ALL records thoroughly and give a complete, accurate, business-ready analysis.
+YOUR JOB: Write a complete, accurate analysis.
 
-ANALYSIS GUIDELINES:
-  - Read EVERY record before forming conclusions.
-  - Count exact occurrences of each theme: "15 out of 45 complaints mention AC problems"
-  - Group into clear categories with counts (e.g. "AC & Cooling: 15", "Water Issues: 8")
-  - Quote actual complaint text (in italics) as evidence for each category
-  - Name specific tenants and properties where patterns are notable
-  - Rank categories from most to least frequent
+GUIDELINES:
+  - The KEYWORD FREQUENCY TABLE is your source of truth for counts — it covers ALL records
+  - Use the counts and percentages from the frequency table as definitive numbers
+  - Quote actual complaint text from the samples as evidence for each category
+  - Rank categories from highest to lowest count
+  - Name specific properties that have the most complaints
   - End with 2-3 concrete, prioritized recommendations
 
 FORMAT:
-  - Start with a one-line summary of total records and top finding
-  - Use ## headers for each category
-  - Show count per category clearly
-  - Length: thorough and complete — cover ALL themes found
+  - Start: one-line summary (total records + top finding)
+  - ## Category Name — X complaints (Y%)
+    - Brief description + 1-2 quoted examples from samples
+  - ## By Property (highlight top 3)
+  - ## Recommendations
 
 STRICT RULES:
-  - NEVER invent data not in the records
-  - NEVER skip records or limit your analysis
-  - Do NOT mention FAISS, vector search, embeddings, or technical terms
-  - Do NOT say "based on the retrieved records" — just answer directly"""
+  - Use the frequency table counts — do NOT re-count from the samples
+  - NEVER invent data
+  - Do NOT mention SQL, REGEXP, keyword scanning, or any technical terms
+  - Do NOT say "based on the data" — just present findings directly"""
 
 
 _RAG_BATCH_PROMPT = """You are analysing a batch of {batch_num}/{total_batches} complaint records.
@@ -1098,9 +1281,12 @@ def synthesise_answer_node(state: AgentState, db_manager=None, **_) -> AgentStat
                 logger.error("[Synthesise-RAG] failed: %s", exc)
                 answer = f"Analysis error: {exc}\n\nRaw data:\n{vec_text[:2000]}"
 
-            answer += "\n\n---\n*Data sources: " + ", ".join(
-                f"{src} ({cnt})" for src, cnt in sources.items()
-            ) + f" | Total in DB: {state.get('vector_results_count', '?')}*"
+            total_in_db = state.get("vector_results_count", "?")
+            answer += (
+                f"\n\n---\n*Analysis covers **{total_in_db} total records** "
+                f"from TERP_MAINT_INCIDENTS table. "
+                f"Sample quotes drawn from {len(vec_records)} randomly selected records.*"
+            )
         else:
             # vector_only or small result set — single LLM call
             llm = _get_llm(max_tokens=2000)
@@ -1286,10 +1472,6 @@ def should_retry_sql(state: AgentState) -> str:
 
     logger.warning("[ShouldRetry] max retries → synthesise fallback")
     return "synthesise"
-
-
-
-
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

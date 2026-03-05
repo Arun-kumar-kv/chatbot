@@ -1,0 +1,93 @@
+services:
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: property-ai:latest
+    container_name: property_ai
+    restart: unless-stopped
+
+    environment:
+      # OpenAI
+      OPENAI_API_KEY:             ${OPENAI_API_KEY}
+      OPENAI_MODEL:               ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_TEMPERATURE:         ${OPENAI_TEMPERATURE:-0.0}
+      OPENAI_MAX_TOKENS:          ${OPENAI_MAX_TOKENS:-2000}
+      EMBEDDING_MODEL:            ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIM:              ${EMBEDDING_DIM:-1536}
+
+      # MySQL — points to your existing DB server
+      SQL_SERVER:                 ${SQL_SERVER:-host.docker.internal}
+      SQL_PORT:                   ${SQL_PORT:-3306}
+      SQL_DATABASE:               ${SQL_DATABASE:-lease_management_db}
+      SQL_USERNAME:               ${SQL_USERNAME:-root}
+      SQL_PASSWORD:               ${SQL_PASSWORD}
+      DB_POOL_SIZE:               ${DB_POOL_SIZE:-10}
+      DB_CONNECT_TIMEOUT:         ${DB_CONNECT_TIMEOUT:-10}
+
+      # FAISS (inside container — mounted from host ./data folder)
+      FAISS_INDEX_PATH:           /app/data/faiss.index
+      FAISS_METADATA_PATH:        /app/data/metadata.pkl
+      VECTOR_TOP_K:               ${VECTOR_TOP_K:-50}
+      VECTOR_DEFAULT_THRESHOLD:   ${VECTOR_DEFAULT_THRESHOLD:-0.25}
+      VECTOR_EXPAND_THRESHOLD:    ${VECTOR_EXPAND_THRESHOLD:-0.15}
+
+      # Agent
+      MAX_SQL_RETRIES:            ${MAX_SQL_RETRIES:-4}
+      SQL_QUERY_HARD_LIMIT:       ${SQL_QUERY_HARD_LIMIT:-5000}
+
+      # Session
+      SESSION_TTL_SECONDS:        ${SESSION_TTL_SECONDS:-3600}
+      SESSION_MAX_HISTORY:        ${SESSION_MAX_HISTORY:-20}
+
+      # Rate limiting
+      RATE_LIMIT_REQUESTS:        ${RATE_LIMIT_REQUESTS:-60}
+      RATE_LIMIT_WINDOW:          ${RATE_LIMIT_WINDOW:-60}
+
+      # Schema cache
+      SCHEMA_CACHE_PATH:          /app/data/schema_cache.json
+      SCHEMA_CACHE_TTL_HOURS:     ${SCHEMA_CACHE_TTL_HOURS:-24}
+
+      # API
+      API_HOST:                   0.0.0.0
+      API_PORT:                   8000
+      API_WORKERS:                ${API_WORKERS:-1}
+      CORS_ORIGINS:               ${CORS_ORIGINS:-*}
+      LOG_LEVEL:                  ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # FAISS index + schema cache — persisted across container restarts
+      - ./data:/app/data
+      # App logs
+      - ./logs:/app/logs
+
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+    # Required so the container can reach MySQL on the host machine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"

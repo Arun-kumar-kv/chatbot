@@ -1651,6 +1651,9 @@
 
 
 #!/usr/bin/env python3
+
+
+#!/usr/bin/env python3
 """
 LLM Prompts – Property Management Agentic RAG Chatbot
 MySQL 5.7 + FAISS.
@@ -1680,11 +1683,20 @@ STRATEGIES:
                                 "Maintenance incidents by tenant", "Legal tenant requests",
                                 "Renewal rate", "Move-out trends", "Rental loss", "Late payers"
 
-2. "vector_only"    – Semantic/text search on free-text document content only.
-                      Examples: "Find leases mentioning noise clause",
-                                "Search contracts that discuss penalty terms"
-                      ⚠️  Do NOT use vector_only for complaint counts, ticket summaries,
-                          or any question that can be answered with a COUNT or GROUP BY.
+2. "vector_only"    – Semantic similarity search on free-text complaint/document content.
+                      Use when question asks to FIND SIMILAR records, SEARCH BY MEANING,
+                      or asks about SENTIMENT / EMOTION / INTENT in tenant complaints.
+                      Examples:
+                        "Find complaints similar to water dripping from ceiling"
+                        "Show incidents where tenants felt unsafe"
+                        "Find tenants who threatened to leave"
+                        "Which tenants mentioned health concerns?"
+                        "Find complaints where tenant mentioned children"
+                        "Search for contracts with unusual cancellation terms"
+                        "Find complaints mentioning lawyer or legal action"
+                        "Show tenants who praised the management"
+                      ⚠️  Do NOT use vector_only for complaint COUNTS or AGGREGATES —
+                          use sql_only for "how many", "total", "most frequent".
 
 3. "hybrid"         – BOTH structured + semantic. Use ONLY for CAUSAL / CORRELATIONAL questions:
                       WHY, HOW DID, WHAT CAUSED, IMPACT OF, EFFECT OF, REASON FOR
@@ -1696,11 +1708,9 @@ RULES — always sql_only for these topics:
   - Contract lookups, expiry, tenant details → sql_only
   - Vacancy / available units / vacancy trends → sql_only
   - Risk, outstanding, collection, bounced cheque → sql_only
-  - Complaints, tickets, maintenance incidents, legal requests → sql_only
   - Renewal rates, churn, move-in, move-out → sql_only
   - Payment behavior, late payers, dues → sql_only
-  - Any question with: "how many", "which", "count", "total", "list", "show", "top", "most" → sql_only
-  - MySQL 5.7; no pgvector; FAISS handles vector search externally
+  - Any question with: "how many", "count", "total", "list", "top", "most frequent" → sql_only
 
 Respond ONLY with valid JSON:
 {
@@ -2175,7 +2185,7 @@ A: {{
 
 Q: "Show all units and their status in SEASTONE RESIDENCE 2"
 A: {{
-  "sql_query": "SELECT `p`.`NAME` AS PROPERTY_NAME, `s`.`STATUS` AS UNIT_STATUS, COUNT(`u`.`ID`) AS UNIT_COUNT FROM `TERP_LS_PROPERTY_UNIT` u INNER JOIN `TERP_LS_PROPERTY_UNIT_STATUS` s ON `s`.`ID` = `u`.`STATUS` INNER JOIN `TERP_LS_PROPERTY` p ON `u`.`PROPERTY_ID` = `p`.`ID` WHERE `p`.`NAME` LIKE '%SEASTONE RESIDENCE 2%' GROUP BY `p`.`NAME`, `s`.`ID`, `s`.`STATUS` ORDER BY `s`.`STATUS` LIMIT 100",
+  "sql_query": "SELECT `p`.`NAME` AS PROPERTY_NAME, `s`.`STATUS` AS UNIT_STATUS, COUNT(`u`.`ID`) AS UNIT_COUNT FROM `TERP_LS_PROPERTY_UNIT` u INNER JOIN `TERP_LS_PROPERTY_UNIT_STATUS` s ON `s`.`ID` = `u`.`STATUS` INNER JOIN `TERP_LS_PROPERTY` p ON `u`.`PROPERTY_ID` = `p`.`ID` WHERE `p`.`NAME` LIKE '%SEASTONE RESIDENCE 2%' GROUP BY `p`.`NAME`, `s`.`ID`, `s`.`NAME` ORDER BY `s`.`STATUS` LIMIT 100",
   "need_embedding": false,
   "embedding_params": []
 }}

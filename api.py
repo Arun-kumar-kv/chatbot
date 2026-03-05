@@ -461,6 +461,7 @@
 #     uvicorn.run("api:app", host=API_HOST, port=API_PORT, reload=False, workers=1)
 
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 FastAPI Application – Property Management Agentic RAG Chatbot
 MySQL 5.7 + FAISS + SchemaManager (token-safe, schema-verified)
@@ -1007,6 +1008,111 @@ async def debug_rag_test():
         report["__table_existence"] = {"error": str(e)}
 
     return report
+
+
+
+
+@app.get("/debug/schema-scan", tags=["Debug"])
+async def debug_schema_scan():
+    """
+    Scans which tables and columns referenced in prompts.py actually exist in the DB.
+    Run this once to find missing tables/columns so prompts can be corrected.
+    """
+    if not _db_manager:
+        raise HTTPException(status_code=503, detail="DB not initialised")
+
+    # Tables and columns referenced in prompts.py that must be verified
+    TABLES_TO_CHECK = {
+        "TERP_LS_CONTRACT": [
+            "ID", "CONTRACT_NUMBER", "TENANT", "ACTIVE", "START_DATE", "END_DATE",
+            "RENEWED", "RENEWAL_STATUS", "RENEWAL_REQUEST_DATE", "RENEWAL_SENT_DATE",
+            "AUTO_RENEWAL", "CANCEL_DATE", "GOVT_REF_NO", "NOTES",
+        ],
+        "TERP_LS_CONTRACT_UNIT": ["ID", "CONTRACT_ID", "UNIT_ID"],
+        "TERP_LS_PROPERTY_UNIT": [
+            "ID", "PROPERTY_ID", "STATUS", "UNIT_TYPE", "AREA", "UNIT_NO",
+        ],
+        "TERP_LS_PROPERTY_UNIT_STATUS": ["ID", "STATUS", "NAME"],
+        "TERP_LS_PROPERTY_UNIT_TYPE": ["ID", "NAME"],
+        "TERP_LS_PROPERTY_UNIT_HISTORY": ["ID", "PROPERTY_UNIT", "NEW_STATUS", "FROM_DATE"],
+        "TERP_LS_PROPERTY": ["ID", "NAME", "IS_ACTIVE", "TYPE", "STATUS"],
+        "TERP_LS_TENANTS": ["ID", "NAME", "EMAIL", "TYPE"],
+        "TERP_LS_INCIDENT_TYPE": ["ID", "NAME"],
+        "TERP_LS_COMPLAINT_CATEGORY": ["ID", "NAME"],
+        "TERP_MAINT_INCIDENTS": [
+            "ID", "TENANT_NAME", "PROPERTY_UNIT", "INCIDENT_TYPE", "COMPLAINT_CATEGORY",
+            "INCIDENT_DATE", "RESOLVED_DATE", "DUE_DATE", "COMPLAINT_DESCRIPTION",
+            "RESOLUTION_NOTES", "STATUS", "PRIORITY",
+        ],
+        "TERP_LS_CONTRACT_CHARGES": [
+            "ID", "CONTRACT_ID", "AMOUNT", "COLLECTED_AMOUNT", "DUE_DATE", "TYPE",
+        ],
+        "TERP_LS_LEGAL_TENANT_REQUEST": ["ID", "DATE", "DESCRIPTION", "MGMT_COMMENTS", "STATUS"],
+        "TERP_LS_TICKET_TENANT": ["ID", "STATUS", "CREATED_AT", "REMARKS", "DESCRIPTION", "NOTES"],
+    }
+
+    all_tables = set(_db_manager.get_all_tables() or [])
+    result = {}
+
+    for table, expected_cols in TABLES_TO_CHECK.items():
+        entry = {"exists": table in all_tables}
+        if not entry["exists"]:
+            entry["status"] = "❌ TABLE MISSING"
+            result[table] = entry
+            continue
+
+        # Check which columns exist
+        try:
+            r = _db_manager.execute_query(f"DESCRIBE `{table}`")
+            if r.get("success"):
+                rows = r.get("rows", [])
+                cols_def = r.get("column_names", [])
+                actual_cols = set()
+                for row in rows:
+                    d = row if isinstance(row, dict) else dict(zip(cols_def, row))
+                    col = str(d.get("Field") or d.get("FIELD") or "")
+                    if col:
+                        actual_cols.add(col.upper())
+
+                missing = [c for c in expected_cols if c.upper() not in actual_cols]
+                present = [c for c in expected_cols if c.upper() in actual_cols]
+
+                # Get row count
+                cnt_r = _db_manager.execute_query(f"SELECT COUNT(*) AS N FROM `{table}`")
+                row_count = "?"
+                if cnt_r.get("success") and cnt_r.get("rows"):
+                    cnt_row = cnt_r["rows"][0]
+                    cnt_cols = cnt_r.get("column_names", [])
+                    d = cnt_row if isinstance(cnt_row, dict) else dict(zip(cnt_cols, cnt_row))
+                    row_count = d.get("N", "?")
+
+                entry["status"]        = "✅ OK" if not missing else f"⚠️  {len(missing)} columns missing"
+                entry["row_count"]     = row_count
+                entry["columns_ok"]    = present
+                entry["columns_missing"] = missing
+                entry["all_columns"]   = sorted(actual_cols)
+            else:
+                entry["status"] = f"❌ DESCRIBE failed: {r.get('error')}"
+        except Exception as e:
+            entry["status"] = f"❌ Error: {e}"
+
+        result[table] = entry
+
+    # Summary
+    missing_tables  = [t for t, v in result.items() if not v.get("exists")]
+    missing_columns = {t: v["columns_missing"] for t, v in result.items()
+                       if v.get("exists") and v.get("columns_missing")}
+
+    result["_SUMMARY"] = {
+        "missing_tables":  missing_tables,
+        "tables_with_missing_columns": missing_columns,
+        "action_needed": (
+            "Fix prompts.py: remove references to missing tables/columns above. "
+            "Use /debug/schema to see full schema."
+        ) if missing_tables or missing_columns else "✅ All tables and columns exist"
+    }
+
+    return result
 
 
 if __name__ == "__main__":

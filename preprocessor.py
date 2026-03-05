@@ -272,6 +272,18 @@ def _needs_resolution(question: str, history: List[Any]) -> bool:
     q_lower = question.lower().strip()
     words   = q_lower.split()
 
+    # Never resolve pure conversational / identity questions — they are always self-contained
+    _CONVERSATIONAL_EXACT = {
+        "who are you", "what are you", "what can you do", "help",
+        "hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye",
+        "what is your name", "whats your name", "tell me about yourself",
+        "how are you", "what do you do", "who made you", "are you an ai",
+        "are you a bot", "are you human", "good morning", "good afternoon",
+        "good evening", "ok", "okay", "got it", "great", "nice",
+    }
+    if q_lower in _CONVERSATIONAL_EXACT or q_lower.rstrip("?!.") in _CONVERSATIONAL_EXACT:
+        return False
+
     # Always resolve short questions — likely a follow-up
     if len(words) <= 4:
         return True
